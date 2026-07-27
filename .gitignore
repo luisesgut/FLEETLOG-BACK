@@ -4,4 +4,4 @@ __pycache__/
 *.pyc
 *.db
 test_match.py
-test_main.http
+test_main.http.idea/

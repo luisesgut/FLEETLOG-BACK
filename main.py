@@ -55,6 +55,10 @@ GRAPH_TENANT_ID = os.getenv("GRAPH_TENANT_ID", "")
 GRAPH_CLIENT_SECRET = os.getenv("GRAPH_CLIENT_SECRET", "")
 EXCEL_SHARE_URL = os.getenv("EXCEL_SHARE_URL", "https://tibioflex.sharepoint.com/:x:/s/COMERCIO/IQDaareP_tHtRJEJmQETxk2zAciIYjkYFKcasykKIvZX3YE?e=SXYrlg")
 
+print(f"[DEBUG] CLIENT_ID={GRAPH_CLIENT_ID!r}")
+print(f"[DEBUG] TENANT_ID={GRAPH_TENANT_ID!r}")
+print(f"[DEBUG] SECRET presente={bool(GRAPH_CLIENT_SECRET)}")
+
 
 
 
