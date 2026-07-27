@@ -7,3 +7,4 @@ pandas>=2.2
 openpyxl>=3.1
 supabase>=2.31
 pydantic>=2.9
+python-jose[cryptography]>=3.3

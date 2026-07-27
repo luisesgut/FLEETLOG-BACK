@@ -29,10 +29,12 @@ from datetime import datetime, timezone
 import httpx
 import pandas as pd
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import Client, create_client
+from auth import verificar_token, get_cliente_usuario
+from auth import verificar_token_ws
 
 
 load_dotenv()
@@ -57,7 +59,10 @@ EXCEL_SHARE_URL = os.getenv("EXCEL_SHARE_URL", "https://tibioflex.sharepoint.com
 
 
 
-
+class RegistroInput(BaseModel):
+    email: str
+    password: str
+    codigo: str
 
 
 _msal_app = msal.ConfidentialClientApplication(
@@ -128,6 +133,22 @@ async def _descargar_excel_bytes() -> bytes:
         )
         res.raise_for_status()
         return res.content
+
+def normalizar_cliente(nombre: str) -> str:
+    """'DESTINY (084)' -> 'DESTINY'. Quita el sufijo entre paréntesis."""
+    return str(nombre or "").split("(")[0].strip().upper()
+
+def filtrar_por_cliente(unidades: list[dict], cliente: str) -> list[dict]:
+    """ADMIN ve todo. Un cliente ve solo sus embarques."""
+    if cliente == "ADMIN":
+        return unidades
+    cliente_norm = cliente.strip().upper()
+    filtradas = []
+    for u in unidades:
+        emb = u.get("embarqueExcel")
+        if emb and normalizar_cliente(emb.get("cliente")) == cliente_norm:
+            filtradas.append(u)
+    return filtradas
 
 def normalizar_clave(texto: str) -> str:
 
@@ -267,29 +288,34 @@ state = AppState()
 # ---------------------------------------------------------------------------
 class ConnectionManager:
     def __init__(self) -> None:
-        self.active: list[WebSocket] = []
+        # ahora guardamos (websocket, cliente) en vez de solo el websocket
+        self.active: list[tuple[WebSocket, str]] = []
         self._lock = asyncio.Lock()
 
-    async def connect(self, ws: WebSocket) -> None:
+    async def connect(self, ws: WebSocket, cliente: str) -> None:
         await ws.accept()
         async with self._lock:
-            self.active.append(ws)
+            self.active.append((ws, cliente))
 
     async def disconnect(self, ws: WebSocket) -> None:
         async with self._lock:
-            if ws in self.active:
-                self.active.remove(ws)
+            self.active = [(w, c) for (w, c) in self.active if w is not ws]
 
-    async def broadcast(self, message: dict) -> None:
+    async def broadcast(self, unidades_completas: list[dict]) -> None:
+        """A cada conexión le manda SOLO lo de su cliente."""
         async with self._lock:
             dead = []
-            for ws in self.active:
+            for ws, cliente in self.active:
                 try:
-                    await ws.send_json(message)
+                    visibles = filtrar_por_cliente(unidades_completas, cliente)
+                    await ws.send_json({
+                        "type": "unidades_update",
+                        "timestamp": state.last_update,
+                        "unidades": visibles,
+                    })
                 except Exception:
                     dead.append(ws)
-            for ws in dead:
-                self.active.remove(ws)
+            self.active = [(w, c) for (w, c) in self.active if w not in dead]
 
 
 manager = ConnectionManager()
@@ -374,14 +400,8 @@ def merge_con_meta(unidades: list[dict]) -> list[dict]:
 
 
 async def broadcast_snapshot() -> None:
-    await manager.broadcast(
-        {
-            "type": "unidades_update",
-            "timestamp": state.last_update,
-            "unidades": merge_con_meta(state.unidades_gps),
-        }
-    )
-
+    todas = merge_con_meta(state.unidades_gps)
+    await manager.broadcast(todas)
 
 # ---------------------------------------------------------------------------
 # Polling GPS
@@ -459,14 +479,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="FleetLog Backend", lifespan=lifespan)
 
+origins_env = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+ALLOWED_ORIGINS = [o.strip() for o in origins_env.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # --------------------------- Modelos de request ----------------------------
 class MetaPatch(BaseModel):
@@ -488,17 +510,19 @@ class LoadStatusPatch(BaseModel):
 
 # ------------------------------- Endpoints ---------------------------------
 @app.get("/api/unidades")
-async def get_unidades():
+async def get_unidades(claims: dict = Depends(verificar_token)):
+    cliente = await get_cliente_usuario(claims, supabase_client)
+    todas = merge_con_meta(state.unidades_gps)
+    visibles = filtrar_por_cliente(todas, cliente)
     return {
-        "unidades": merge_con_meta(state.unidades_gps),
+        "unidades": visibles,
+        "cliente": cliente,
         "lastUpdate": state.last_update,
-        "lastError": state.last_error,
     }
 
 
-
 @app.patch("/api/unidades/{truck_id}/meta")
-async def patch_meta(truck_id: str, body: MetaPatch):
+async def patch_meta(truck_id: str, body: MetaPatch, claims: dict = Depends(verificar_token)):
     fields: dict = {}
     if body.driver is not None:
         fields["driver"] = body.driver.strip()
@@ -520,7 +544,7 @@ async def patch_meta(truck_id: str, body: MetaPatch):
 
 
 @app.put("/api/unidades/{truck_id}/load")
-async def put_load(truck_id: str, body: LoadInput):
+async def put_load(truck_id: str, body: LoadInput, claims: dict = Depends(verificar_token)):
     if body.status not in VALID_LOAD_STATUS:
         raise HTTPException(400, f"Estado de load inválido: {body.status}")
     load = {
@@ -536,7 +560,7 @@ async def put_load(truck_id: str, body: LoadInput):
 
 
 @app.patch("/api/unidades/{truck_id}/load")
-async def patch_load(truck_id: str, body: LoadStatusPatch):
+async def patch_load(truck_id: str, body: LoadStatusPatch, claims: dict = Depends(verificar_token)):
     if body.status not in VALID_LOAD_STATUS:
         raise HTTPException(400, f"Estado de load inválido: {body.status}")
     meta = get_all_meta().get(truck_id)
@@ -549,10 +573,37 @@ async def patch_load(truck_id: str, body: LoadStatusPatch):
 
 
 @app.delete("/api/unidades/{truck_id}/load")
-async def delete_load(truck_id: str):
+async def delete_load(truck_id: str, claims: dict = Depends(verificar_token)):
     upsert_meta(truck_id, load=None)
     await broadcast_snapshot()
     return {"ok": True}
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket, token: str = ""):
+    # 1. Validar token ANTES de aceptar la conexión
+    try:
+        claims = await verificar_token_ws(token)
+        cliente = await get_cliente_usuario(claims, supabase_client)
+    except Exception:
+        await ws.close(code=1008)  # 1008 = policy violation
+        return
+
+    # 2. Conectar con su cliente
+    await manager.connect(ws, cliente)
+    try:
+        # snapshot inicial, ya filtrado
+        todas = merge_con_meta(state.unidades_gps)
+        await ws.send_json({
+            "type": "snapshot",
+            "timestamp": state.last_update,
+            "unidades": filtrar_por_cliente(todas, cliente),
+        })
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        await manager.disconnect(ws)
+    except Exception:
+        await manager.disconnect(ws)
 
 
 @app.get("/api/health")
@@ -566,20 +617,29 @@ async def health():
     }
 
 
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await manager.connect(ws)
+
+@app.post("/api/registro")
+async def registro(body: RegistroInput):
+    # 1. Validar el código de invitación
+    res = supabase_client.table("codigos_invitacion").select("cliente,activo").eq("codigo", body.codigo.strip()).execute()
+    if not res.data or not res.data[0]["activo"]:
+        raise HTTPException(400, "Código de invitación inválido")
+    cliente = res.data[0]["cliente"]
+
+    # 2. Crear el usuario en Supabase Auth (admin, con service_role)
     try:
-        await ws.send_json(
-            {
-                "type": "snapshot",
-                "timestamp": state.last_update,
-                "unidades": merge_con_meta(state.unidades_gps),
-            }
-        )
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        await manager.disconnect(ws)
-    except Exception:
-        await manager.disconnect(ws)
+        nuevo = supabase_client.auth.admin.create_user({
+            "email": body.email.strip().lower(),
+            "password": body.password,
+            "email_confirm": True,   # sin verificación por correo; cámbialo si la quieres
+        })
+        user_id = nuevo.user.id
+    except Exception as e:
+        raise HTTPException(400, f"No se pudo crear el usuario: {e}")
+
+    # 3. Crear su perfil con el cliente del código
+    supabase_client.table("perfiles").insert({"user_id": user_id, "cliente": cliente}).execute()
+
+    return {"ok": True, "cliente": cliente}
+
+
