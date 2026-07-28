@@ -14,6 +14,7 @@ Ejecutar:
 
 import asyncio
 import base64
+from typing import Optional, Dict
 
 import msal
 import io
@@ -63,6 +64,12 @@ class RegistroInput(BaseModel):
     password: str
     codigo: str
 
+class OverrideInput(BaseModel):
+        destino: Optional[str] = None
+        carrier: Optional[str] = None
+        aduana: Optional[str] = None
+        noFactura: Optional[str] = None
+
 
 _msal_app = msal.ConfidentialClientApplication(
     GRAPH_CLIENT_ID,
@@ -86,6 +93,7 @@ if SUPABASE_URL and SUPABASE_KEY:
 
 # Caché en memoria para embarques del Excel
 embarques_excel_cache: dict[str, dict] = {}
+overrides_cache: Dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +140,29 @@ async def _descargar_excel_bytes() -> bytes:
         )
         res.raise_for_status()
         return res.content
+
+async def cargar_overrides():
+        """Lee los overrides de Supabase al cache. Llamar al arrancar y tras cada edición."""
+        global overrides_cache
+        try:
+            res = supabase_client.table("embarque_overrides").select("*").execute()
+            overrides_cache = {r["numero_caja"]: r for r in (res.data or [])}
+            logger.info("Overrides cargados: %d", len(overrides_cache))
+        except Exception as e:
+            logger.error("Error cargando overrides: %s", e)
+
+def aplicar_override(caja: str, embarque: dict) -> dict:
+        """El Excel manda; el override SOLO tapa los campos que el Excel dejó vacíos."""
+        ov = overrides_cache.get(caja)
+        if not ov:
+            return embarque
+        resultado = dict(embarque)
+        mapeo = {"destino": "destino", "carrier": "carrier", "aduana": "aduana", "noFactura": "no_factura"}
+        for campo_emb, campo_ov in mapeo.items():
+            if not resultado.get(campo_emb) and ov.get(campo_ov):
+                resultado[campo_emb] = ov[campo_ov]
+                resultado[f"{campo_emb}Manual"] = True  # para que el front lo pinte distinto
+        return resultado
 
 def normalizar_cliente(nombre: str) -> str:
     """'DESTINY (084)' -> 'DESTINY'. Quita el sufijo entre paréntesis."""
@@ -384,15 +415,18 @@ def merge_con_meta(unidades: list[dict]) -> list[dict]:
                 "statusOverride": m.get("status"),
                 "visible": m.get("visible", False),
                 "load": m.get("load"),
-                "embarqueExcel": {
-                    "cliente": datos_excel.get("cliente", ""),
-                    "destino": datos_excel.get("destino", ""),
-                    "carrier": datos_excel.get("carrier", ""),
-                    "aduana": datos_excel.get("aduana", ""),
-                    "noFactura": datos_excel.get("no_factura", ""),
-                    "cajaCruce": datos_excel.get("caja_cruce", ""),
-                    "status": datos_excel.get("status", ""),
-                }
+                "embarqueExcel": aplicar_override(
+                    num_unidad_norm,
+                    {
+                        "cliente": datos_excel.get("cliente", ""),
+                        "destino": datos_excel.get("destino", ""),
+                        "carrier": datos_excel.get("carrier", ""),
+                        "aduana": datos_excel.get("aduana", ""),
+                        "noFactura": datos_excel.get("no_factura", ""),
+                        "cajaCruce": datos_excel.get("caja_cruce", ""),
+                        "status": datos_excel.get("status", ""),
+                    },
+                )
                 if datos_excel
                 else None,
             }
@@ -581,6 +615,38 @@ async def patch_load(truck_id: str, body: LoadStatusPatch, claims: dict = Depend
     upsert_meta(truck_id, load=load)
     await broadcast_snapshot()
     return load
+
+@app.patch("/api/embarques/{numero_caja}/override")
+async def patch_override(numero_caja: str, body: OverrideInput, claims: dict = Depends(verificar_token)):
+    perfil = await get_perfil_usuario(claims, supabase_client)
+    if perfil["rol"] == "cliente":
+        raise HTTPException(403, "Los clientes no pueden editar")
+
+    caja = normalizar_clave(numero_caja)
+
+    # Verificar que el embarque exista y sea del cliente del asesor (o admin)
+    emb = embarques_excel_cache.get(caja)
+    if not emb:
+        raise HTTPException(404, "Embarque no encontrado")
+    if perfil["cliente"] != "ADMIN" and normalizar_cliente(emb.get("cliente")) != perfil["cliente"]:
+        raise HTTPException(403, "No puedes editar embarques de otro cliente")
+
+    datos = {
+        "numero_caja": caja,
+        "editado_por": claims.get("sub"),
+        "editado_en": datetime.now(timezone.utc).isoformat(),
+    }
+    if body.destino is not None: datos["destino"] = body.destino.strip()
+    if body.carrier is not None: datos["carrier"] = body.carrier.strip()
+    if body.aduana is not None: datos["aduana"] = body.aduana.strip()
+    if body.noFactura is not None: datos["no_factura"] = body.noFactura.strip()
+
+    supabase_client.table("embarque_overrides").upsert(datos, on_conflict="numero_caja").execute()
+
+    # Refrescar el cache de overrides y avisar por WS
+    await cargar_overrides()
+    await broadcast_snapshot()
+    return {"ok": True, "numero_caja": caja}
 
 
 @app.delete("/api/unidades/{truck_id}/load")
