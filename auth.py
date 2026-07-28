@@ -50,17 +50,17 @@ async def verificar_token(authorization: str = Header(default="")) -> dict:
         raise HTTPException(401, f"Token inválido: {e}")
 
 
-async def get_cliente_usuario(claims: dict, supabase_client) -> str:
-    """Del token saca el user_id, busca su cliente en 'perfiles'.
-    Regresa el cliente (ej 'DESTINY') o 'ADMIN'."""
+async def get_perfil_usuario(claims: dict, supabase_client) -> dict:
+    """Del token saca el user_id, busca su cliente y rol en 'perfiles'.
+    Regresa {'cliente': 'DESTINY', 'rol': 'asesor'} por ejemplo."""
     user_id = claims.get("sub")
     if not user_id:
         raise HTTPException(401, "Token sin user_id")
 
-    res = supabase_client.table("perfiles").select("cliente").eq("user_id", user_id).execute()
+    res = supabase_client.table("perfiles").select("cliente,rol").eq("user_id", user_id).execute()
     if not res.data:
-        raise HTTPException(403, "Usuario sin cliente asignado")
-    return res.data[0]["cliente"]
+        raise HTTPException(403, "Usuario sin perfil asignado")
+    return {"cliente": res.data[0]["cliente"], "rol": res.data[0]["rol"]}
 
 async def verificar_token_ws(token: str) -> dict:
     """Igual que verificar_token pero recibe el token crudo (del query param del WS)."""

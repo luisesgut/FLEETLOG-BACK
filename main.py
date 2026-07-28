@@ -33,9 +33,8 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depe
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import Client, create_client
-from auth import verificar_token, get_cliente_usuario
+from auth import verificar_token, get_perfil_usuario
 from auth import verificar_token_ws
-
 
 load_dotenv()
 
@@ -138,16 +137,20 @@ def normalizar_cliente(nombre: str) -> str:
     """'DESTINY (084)' -> 'DESTINY'. Quita el sufijo entre paréntesis."""
     return str(nombre or "").split("(")[0].strip().upper()
 
-def filtrar_por_cliente(unidades: list[dict], cliente: str) -> list[dict]:
-    """ADMIN ve todo. Un cliente ve solo sus embarques."""
+def filtrar_por_cliente(unidades: list[dict], cliente: str, rol: str = "asesor") -> list[dict]:
+    """ADMIN ve todo. Asesor ve todo lo de su cliente. Cliente solo lo visible."""
     if cliente == "ADMIN":
         return unidades
     cliente_norm = cliente.strip().upper()
     filtradas = []
     for u in unidades:
         emb = u.get("embarqueExcel")
-        if emb and normalizar_cliente(emb.get("cliente")) == cliente_norm:
-            filtradas.append(u)
+        if not emb or normalizar_cliente(emb.get("cliente")) != cliente_norm:
+            continue
+        # El cliente final solo ve las unidades marcadas visibles
+        if rol == "cliente" and not u.get("visible"):
+            continue
+        filtradas.append(u)
     return filtradas
 
 def normalizar_clave(texto: str) -> str:
@@ -288,26 +291,26 @@ state = AppState()
 # ---------------------------------------------------------------------------
 class ConnectionManager:
     def __init__(self) -> None:
-        # ahora guardamos (websocket, cliente) en vez de solo el websocket
-        self.active: list[tuple[WebSocket, str]] = []
+        # guardamos (websocket, cliente, rol)
+        self.active: list[tuple[WebSocket, str, str]] = []
         self._lock = asyncio.Lock()
 
-    async def connect(self, ws: WebSocket, cliente: str) -> None:
+    async def connect(self, ws: WebSocket, cliente: str, rol: str) -> None:
         await ws.accept()
         async with self._lock:
-            self.active.append((ws, cliente))
+            self.active.append((ws, cliente, rol))
 
     async def disconnect(self, ws: WebSocket) -> None:
         async with self._lock:
-            self.active = [(w, c) for (w, c) in self.active if w is not ws]
+            self.active = [(w, c, r) for (w, c, r) in self.active if w is not ws]
 
     async def broadcast(self, unidades_completas: list[dict]) -> None:
-        """A cada conexión le manda SOLO lo de su cliente."""
+        """A cada conexión le manda SOLO lo que le toca según cliente y rol."""
         async with self._lock:
             dead = []
-            for ws, cliente in self.active:
+            for ws, cliente, rol in self.active:
                 try:
-                    visibles = filtrar_por_cliente(unidades_completas, cliente)
+                    visibles = filtrar_por_cliente(unidades_completas, cliente, rol)
                     await ws.send_json({
                         "type": "unidades_update",
                         "timestamp": state.last_update,
@@ -315,9 +318,7 @@ class ConnectionManager:
                     })
                 except Exception:
                     dead.append(ws)
-            self.active = [(w, c) for (w, c) in self.active if w not in dead]
-
-
+            self.active = [(w, c, r) for (w, c, r) in self.active if w not in dead]
 manager = ConnectionManager()
 
 
@@ -511,18 +512,22 @@ class LoadStatusPatch(BaseModel):
 # ------------------------------- Endpoints ---------------------------------
 @app.get("/api/unidades")
 async def get_unidades(claims: dict = Depends(verificar_token)):
-    cliente = await get_cliente_usuario(claims, supabase_client)
+    perfil = await get_perfil_usuario(claims, supabase_client)
     todas = merge_con_meta(state.unidades_gps)
-    visibles = filtrar_por_cliente(todas, cliente)
+    visibles = filtrar_por_cliente(todas, perfil["cliente"], perfil["rol"])
     return {
         "unidades": visibles,
-        "cliente": cliente,
+        "cliente": perfil["cliente"],
+        "rol": perfil["rol"],
         "lastUpdate": state.last_update,
     }
 
 
 @app.patch("/api/unidades/{truck_id}/meta")
 async def patch_meta(truck_id: str, body: MetaPatch, claims: dict = Depends(verificar_token)):
+    perfil = await get_perfil_usuario(claims, supabase_client)
+    if perfil["rol"] == "cliente":
+        raise HTTPException(403, "Los clientes no pueden editar")
     fields: dict = {}
     if body.driver is not None:
         fields["driver"] = body.driver.strip()
@@ -545,6 +550,9 @@ async def patch_meta(truck_id: str, body: MetaPatch, claims: dict = Depends(veri
 
 @app.put("/api/unidades/{truck_id}/load")
 async def put_load(truck_id: str, body: LoadInput, claims: dict = Depends(verificar_token)):
+    perfil = await get_perfil_usuario(claims, supabase_client)
+    if perfil["rol"] == "cliente":
+        raise HTTPException(403, "Los clientes no pueden editar")
     if body.status not in VALID_LOAD_STATUS:
         raise HTTPException(400, f"Estado de load inválido: {body.status}")
     load = {
@@ -561,6 +569,9 @@ async def put_load(truck_id: str, body: LoadInput, claims: dict = Depends(verifi
 
 @app.patch("/api/unidades/{truck_id}/load")
 async def patch_load(truck_id: str, body: LoadStatusPatch, claims: dict = Depends(verificar_token)):
+    perfil = await get_perfil_usuario(claims, supabase_client)
+    if perfil["rol"] == "cliente":
+        raise HTTPException(403, "Los clientes no pueden editar")
     if body.status not in VALID_LOAD_STATUS:
         raise HTTPException(400, f"Estado de load inválido: {body.status}")
     meta = get_all_meta().get(truck_id)
@@ -574,6 +585,9 @@ async def patch_load(truck_id: str, body: LoadStatusPatch, claims: dict = Depend
 
 @app.delete("/api/unidades/{truck_id}/load")
 async def delete_load(truck_id: str, claims: dict = Depends(verificar_token)):
+    perfil = await get_perfil_usuario(claims, supabase_client)
+    if perfil["rol"] == "cliente":
+        raise HTTPException(403, "Los clientes no pueden editar")
     upsert_meta(truck_id, load=None)
     await broadcast_snapshot()
     return {"ok": True}
@@ -583,20 +597,22 @@ async def websocket_endpoint(ws: WebSocket, token: str = ""):
     # 1. Validar token ANTES de aceptar la conexión
     try:
         claims = await verificar_token_ws(token)
-        cliente = await get_cliente_usuario(claims, supabase_client)
+        perfil = await get_perfil_usuario(claims, supabase_client)
+        cliente = perfil["cliente"]
+        rol = perfil["rol"]
     except Exception:
         await ws.close(code=1008)  # 1008 = policy violation
         return
 
     # 2. Conectar con su cliente
-    await manager.connect(ws, cliente)
+    await manager.connect(ws, cliente, rol)
     try:
         # snapshot inicial, ya filtrado
         todas = merge_con_meta(state.unidades_gps)
         await ws.send_json({
             "type": "snapshot",
             "timestamp": state.last_update,
-            "unidades": filtrar_por_cliente(todas, cliente),
+            "unidades": filtrar_por_cliente(todas, cliente, rol),
         })
         while True:
             await ws.receive_text()
@@ -620,26 +636,26 @@ async def health():
 
 @app.post("/api/registro")
 async def registro(body: RegistroInput):
-    # 1. Validar el código de invitación
-    res = supabase_client.table("codigos_invitacion").select("cliente,activo").eq("codigo", body.codigo.strip()).execute()
+    # 1. Validar el código de invitación (ahora trae cliente Y rol)
+    res = supabase_client.table("codigos_invitacion").select("cliente,rol,activo").eq("codigo", body.codigo.strip()).execute()
     if not res.data or not res.data[0]["activo"]:
         raise HTTPException(400, "Código de invitación inválido")
     cliente = res.data[0]["cliente"]
+    rol = res.data[0]["rol"]
 
     # 2. Crear el usuario en Supabase Auth (admin, con service_role)
     try:
         nuevo = supabase_client.auth.admin.create_user({
             "email": body.email.strip().lower(),
             "password": body.password,
-            "email_confirm": True,   # sin verificación por correo; cámbialo si la quieres
+            "email_confirm": True,
         })
         user_id = nuevo.user.id
     except Exception as e:
         raise HTTPException(400, f"No se pudo crear el usuario: {e}")
 
-    # 3. Crear su perfil con el cliente del código
-    supabase_client.table("perfiles").insert({"user_id": user_id, "cliente": cliente}).execute()
+    # 3. Crear su perfil con el cliente Y rol del código
+    supabase_client.table("perfiles").insert({"user_id": user_id, "cliente": cliente, "rol": rol}).execute()
 
-    return {"ok": True, "cliente": cliente}
-
+    return {"ok": True, "cliente": cliente, "rol": rol}
 
