@@ -514,7 +514,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="FleetLog Backend", lifespan=lifespan)
 
-origins_env = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+origins_env = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,https://fleetlog-front.vercel.app")
 ALLOWED_ORIGINS = [o.strip() for o in origins_env.split(",") if o.strip()]
 
 app.add_middleware(
