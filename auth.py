@@ -1,6 +1,6 @@
 """
 auth.py — Verificación de JWT de Supabase (asimétrico ES256 vía JWKS)
-y resolución del cliente del usuario.
+y resolución del cliente del usuario. prueba
 """
 import os
 import time
