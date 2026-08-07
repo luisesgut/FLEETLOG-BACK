@@ -94,6 +94,9 @@ if SUPABASE_URL and SUPABASE_KEY:
 # Caché en memoria para embarques del Excel
 embarques_excel_cache: dict[str, dict] = {}
 overrides_cache: Dict[str, dict] = {}
+# Vista admin: TODAS las filas abiertas del Excel (sin dedup por caja) + sus overrides
+embarques_filas_cache: list[dict] = []
+fila_overrides_cache: Dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +154,16 @@ async def cargar_overrides():
         except Exception as e:
             logger.error("Error cargando overrides: %s", e)
 
+async def cargar_fila_overrides():
+        """Lee los overrides POR FILA (tracking url, comentario, load/orden) de Supabase."""
+        global fila_overrides_cache
+        try:
+            res = supabase_client.table("embarque_fila_overrides").select("*").execute()
+            fila_overrides_cache = {r["fila_key"]: r for r in (res.data or [])}
+            logger.info("Fila-overrides cargados: %d", len(fila_overrides_cache))
+        except Exception as e:
+            logger.error("Error cargando fila-overrides: %s", e)
+
 def aplicar_override(caja: str, embarque: dict) -> dict:
         """El Excel manda; el override SOLO tapa los campos que el Excel dejó vacíos."""
         ov = overrides_cache.get(caja)
@@ -184,6 +197,15 @@ def filtrar_por_cliente(unidades: list[dict], cliente: str, rol: str = "asesor")
         filtradas.append(u)
     return filtradas
 
+def fila_key(caja: str, cliente: str, factura: str) -> str:
+    """Clave única por fila: caja|cliente|factura. Distingue el caso de misma caja
+    con distintos clientes (ej. TBIN205 en Quality y Bunzl)."""
+    c = normalizar_clave(caja)
+    cl = normalizar_cliente(cliente)
+    f = str(factura or "").strip().upper()
+    return f"{c}|{cl}|{f}"
+
+
 def normalizar_clave(texto: str) -> str:
 
     s = str(texto or "")
@@ -191,14 +213,15 @@ def normalizar_clave(texto: str) -> str:
     return s.replace(" ", "").replace("-", "").strip().upper()
 # --- FUNCIÓN DE SINCRONIZACIÓN EXCEL -> SUPABASE ---
 async def sync_excel_to_supabase() -> None:
-    """Lee la pestaña EXPO del Excel, filtra STATUS != 7 e ignora registros ECO."""
-    global embarques_excel_cache
+    """Lee EXPO. Arma 2 vistas:
+    - por caja (vista GPS): ignora STATUS 7, dedup por caja.
+    - filas admin: TODAS las filas abiertas (no empieza con 6 ni 7), sin dedup."""
+    global embarques_excel_cache, embarques_filas_cache
 
     try:
         logger.info("Iniciando procesamiento del Excel...")
 
         # 1. Obtener el contenido (Archivo local o SharePoint URL)
-        # 1. Obtener el contenido
         if EXCEL_LOCAL_PATH and os.path.exists(EXCEL_LOCAL_PATH):
             logger.info("Cargando Excel desde archivo local: %s", EXCEL_LOCAL_PATH)
             excel_source = EXCEL_LOCAL_PATH
@@ -211,27 +234,47 @@ async def sync_excel_to_supabase() -> None:
         df = df.fillna("")
 
         registros_dict = {}
+        filas_admin: list[dict] = []
 
         for _, row in df.iterrows():
             caja_raw = str(row.get("No. Caja / Unidad", "")).strip()
             status_val = str(row.get("STATUS", "")).strip()
+            cliente_raw = str(row.get("Cliente", "")).strip()
+            factura_raw = str(row.get("No. Factura", "")).strip()
+            carrier_raw = str(row.get("Carrier", "")).strip()
 
             caja_norm = normalizar_clave(caja_raw)
-            # REGLA 1: Ignorar vacíos o unidades que empiecen con 'ECO'
+            # REGLA 1: Ignorar vacíos o unidades que empiecen con 'ECO' (aplica a AMBAS vistas)
             if not caja_norm or caja_norm.lower() == "nan" or caja_norm.startswith("ECO"):
                 continue
 
-            # REGLA 2: Ignorar registros con STATUS 7 (ej. "7. Cerrado" o que empiece con 7)
+            # --- VISTA ADMIN: todas las filas ABIERTAS (no empieza con 6 ni 7; blanco = abierto) ---
+            es_cerrado = status_val.startswith("6") or status_val.startswith("7")
+            if not es_cerrado:
+                filas_admin.append({
+                    "filaKey": fila_key(caja_raw, cliente_raw, factura_raw),
+                    "caja": caja_raw,
+                    "cliente": cliente_raw,
+                    "carrier": carrier_raw,
+                    "aduana": str(row.get("Aduana", "")).strip(),
+                    "destino": str(row.get("Destino", "")).strip(),
+                    "noFactura": factura_raw,
+                    "pedimento": str(row.get("Pedimento", "")).strip(),
+                    "status": status_val,
+                    "esEDR": carrier_raw.upper() == "EDR",
+                })
+
+            # REGLA 2 (VISTA GPS): Ignorar registros con STATUS 7
             if status_val.startswith("7"):
                 continue
 
             item = {
                 "numero_caja": caja_norm,  # Guardamos clave normalizada
-                "cliente": str(row.get("Cliente", "")).strip(),
+                "cliente": cliente_raw,
                 "destino": str(row.get("Destino", "")).strip(),
-                "carrier": str(row.get("Carrier", "")).strip(),
+                "carrier": carrier_raw,
                 "aduana": str(row.get("Aduana", "")).strip(),
-                "no_factura": str(row.get("No. Factura", "")).strip(),
+                "no_factura": factura_raw,
                 "caja_cruce": str(row.get("Caja de cruce / Unidad", "")).strip(),
                 "status": status_val,
             }
@@ -254,7 +297,11 @@ async def sync_excel_to_supabase() -> None:
             )
 
         embarques_excel_cache = nuevo_cache
-        logger.info("Caché local actualizado con %d embarques activos.", len(nuevo_cache))
+        embarques_filas_cache = filas_admin
+        logger.info(
+            "Caché actualizado: %d por-caja, %d filas-admin abiertas.",
+            len(nuevo_cache), len(filas_admin),
+        )
 
     except Exception as e:
         logger.exception("Error durante la sincronización del Excel: %s", e)
@@ -498,6 +545,10 @@ async def polling_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # Cargar overrides desde Supabase al arrancar
+    if supabase_client:
+        await cargar_overrides()
+        await cargar_fila_overrides()
     # Tarea 1: Polling GPS
     task_gps = asyncio.create_task(polling_loop())
     # Tarea 2: Sync Excel
@@ -541,6 +592,12 @@ class LoadInput(BaseModel):
 
 class LoadStatusPatch(BaseModel):
     status: str
+
+
+class FilaOverrideInput(BaseModel):
+    trackingUrl: Optional[str] = None
+    comentario: Optional[str] = None
+    loadOrden: Optional[str] = None
 
 
 # ------------------------------- Endpoints ---------------------------------
@@ -658,6 +715,68 @@ async def delete_load(truck_id: str, claims: dict = Depends(verificar_token)):
     await broadcast_snapshot()
     return {"ok": True}
 
+
+# ---------------------------------------------------------------------------
+# Vista ADMIN de embarques: TODAS las filas abiertas del Excel
+# ---------------------------------------------------------------------------
+@app.get("/api/embarques")
+async def get_embarques(claims: dict = Depends(verificar_token)):
+    perfil = await get_perfil_usuario(claims, supabase_client)
+    if perfil["cliente"] != "ADMIN":
+        raise HTTPException(403, "Solo el administrador puede ver esta vista")
+
+    # GPS por caja normalizada, para pegar coordenadas a las filas EDR
+    gps_por_caja = {}
+    for u in merge_con_meta(state.unidades_gps):
+        gps_por_caja[normalizar_clave(u.get("unidad"))] = u
+
+    filas = []
+    for f in embarques_filas_cache:
+        ov = fila_overrides_cache.get(f["filaKey"], {})
+        gps = gps_por_caja.get(normalizar_clave(f["caja"])) if f["esEDR"] else None
+        filas.append({
+            **f,
+            "trackingUrl": ov.get("tracking_url", ""),
+            "comentario": ov.get("comentario", ""),
+            "loadOrden": ov.get("load_orden", ""),
+            "gps": {
+                "posicion": gps.get("posicion"),
+                "velocidad": gps.get("velocidad"),
+                "fechaHoraGps": gps.get("fechaHoraGps"),
+                "direccion": gps.get("direccion"),
+            } if gps else None,
+        })
+    return {"embarques": filas, "total": len(filas)}
+
+
+@app.patch("/api/embarques/fila/override")
+async def patch_fila_override(
+    body: FilaOverrideInput,
+    fila_key_q: str,
+    claims: dict = Depends(verificar_token),
+):
+    perfil = await get_perfil_usuario(claims, supabase_client)
+    if perfil["cliente"] != "ADMIN":
+        raise HTTPException(403, "Solo el administrador puede editar aquí")
+
+    datos = {
+        "fila_key": fila_key_q,
+        "editado_por": claims.get("sub"),
+        "editado_en": datetime.now(timezone.utc).isoformat(),
+    }
+    if body.trackingUrl is not None:
+        datos["tracking_url"] = body.trackingUrl.strip()
+    if body.comentario is not None:
+        datos["comentario"] = body.comentario.strip()
+    if body.loadOrden is not None:
+        datos["load_orden"] = body.loadOrden.strip()
+
+    supabase_client.table("embarque_fila_overrides").upsert(
+        datos, on_conflict="fila_key"
+    ).execute()
+    await cargar_fila_overrides()
+    return {"ok": True, "filaKey": fila_key_q}
+
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, token: str = ""):
     # 1. Validar token ANTES de aceptar la conexión
@@ -724,4 +843,3 @@ async def registro(body: RegistroInput):
     supabase_client.table("perfiles").insert({"user_id": user_id, "cliente": cliente, "rol": rol}).execute()
 
     return {"ok": True, "cliente": cliente, "rol": rol}
-
