@@ -717,7 +717,10 @@ async def delete_load(truck_id: str, claims: dict = Depends(verificar_token)):
 
 
 # ---------------------------------------------------------------------------
-# Vista ADMIN de embarques: TODAS las filas abiertas del Excel
+# Vista ADMIN de embarques: seccionada en 3 grupos
+#   - edr:          filas del Excel con carrier EDR (con GPS pegado si reporta)
+#   - gpsSinExcel:  unidades reportando en GPS SIN fila abierta en el Excel
+#   - otrosCarriers: filas del Excel de carriers no-EDR (necesitan liga manual)
 # ---------------------------------------------------------------------------
 @app.get("/api/embarques")
 async def get_embarques(claims: dict = Depends(verificar_token)):
@@ -725,16 +728,15 @@ async def get_embarques(claims: dict = Depends(verificar_token)):
     if perfil["cliente"] != "ADMIN":
         raise HTTPException(403, "Solo el administrador puede ver esta vista")
 
-    # GPS por caja normalizada, para pegar coordenadas a las filas EDR
+    # GPS por caja normalizada
+    unidades_gps = merge_con_meta(state.unidades_gps)
     gps_por_caja = {}
-    for u in merge_con_meta(state.unidades_gps):
+    for u in unidades_gps:
         gps_por_caja[normalizar_clave(u.get("unidad"))] = u
 
-    filas = []
-    for f in embarques_filas_cache:
+    def _armar_fila(f: dict, gps: dict | None) -> dict:
         ov = fila_overrides_cache.get(f["filaKey"], {})
-        gps = gps_por_caja.get(normalizar_clave(f["caja"])) if f["esEDR"] else None
-        filas.append({
+        return {
             **f,
             "trackingUrl": ov.get("tracking_url", ""),
             "comentario": ov.get("comentario", ""),
@@ -745,8 +747,47 @@ async def get_embarques(claims: dict = Depends(verificar_token)):
                 "fechaHoraGps": gps.get("fechaHoraGps"),
                 "direccion": gps.get("direccion"),
             } if gps else None,
-        })
-    return {"embarques": filas, "total": len(filas)}
+        }
+
+    edr: list[dict] = []
+    otros_carriers: list[dict] = []
+    cajas_excel_edr: set[str] = set()
+
+    for f in embarques_filas_cache:
+        if f["esEDR"]:
+            caja_n = normalizar_clave(f["caja"])
+            cajas_excel_edr.add(caja_n)
+            edr.append(_armar_fila(f, gps_por_caja.get(caja_n)))
+        else:
+            otros_carriers.append(_armar_fila(f, None))
+
+    # Unidades del GPS que NO tienen fila abierta en el Excel -> "falta rellenar en Excel"
+    gps_sin_excel: list[dict] = []
+    for u in unidades_gps:
+        caja_n = normalizar_clave(u.get("unidad"))
+        if caja_n and caja_n not in cajas_excel_edr:
+            gps_sin_excel.append({
+                "caja": u.get("unidad", ""),
+                "placas": u.get("placas", ""),
+                "gps": {
+                    "posicion": u.get("posicion"),
+                    "velocidad": u.get("velocidad"),
+                    "fechaHoraGps": u.get("fechaHoraGps"),
+                    "direccion": u.get("direccion"),
+                },
+                "motivo": "Sin fila abierta en el Excel (falta rellenar o el embarque está cerrado)",
+            })
+
+    return {
+        "edr": edr,
+        "gpsSinExcel": gps_sin_excel,
+        "otrosCarriers": otros_carriers,
+        "totales": {
+            "edr": len(edr),
+            "gpsSinExcel": len(gps_sin_excel),
+            "otrosCarriers": len(otros_carriers),
+        },
+    }
 
 
 @app.patch("/api/embarques/fila/override")
